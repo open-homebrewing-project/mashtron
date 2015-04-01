@@ -1,10 +1,8 @@
-var Cylon = require("cylon"),
+var Cylon = require('cylon'),
     fs = require('fs'),
     StatsD = require('node-statsd'),
     client = new StatsD(),
-    prob =  "/home/pi/temp1",
     Twitter = require('twitter'),
-    twitMention = process.env.TWITTER_MENTION_NAME,
     twit = new Twitter({
       consumer_key: process.env.TWITTER_CONSUMER_KEY,
       consumer_secret: process.env.TWITTER_CONSUMER_SECRET,
@@ -17,83 +15,103 @@ var Cylon = require("cylon"),
     }
     parseProbResults = function (data) {
       return (parseInt(data.split("t=")[1])) / 1000;
-    },
-    currentMashTemp = 0,
-    receipe = {
-      name: "Belgian Golden Strong Ale",
-      url: "https://www.brewtoad.com/recipes/belgian-golden-strong-ale-21",
-      mashTemp: 168.9,
-      mashTime: 75
-    },
-    currentStep = "starting",
-    currentTime = null;
-
+    };
 
 Cylon.robot({
-  connections: {
-    raspi: { adaptor: 'raspi' }
+  probPath: "/home/pi/temp2",
+  name: "MashTron",
+  recipe: {
+    name: "Weizenbock Halfie",
+    url: "https://www.brewtoad.com/recipes/weizenbock-halfie-jz",
+    mashTemp: 168.9,
+    mashTime: 60
   },
-
+  notify: {
+    name: "@AgentO3"
+  },
+  currentTemp: 0,
+  currentStep: "startup",
+  connections: {
+    robot: { adaptor: "loopback" }
+  },
 
   work: function(my) {
+    // Startup MashTron
+    my.robot.emit("start");
 
-    every((10).second(), function() {
-      my.readTemp(prob, function (temp) {
-        console.log(temp);
-        currentMashTemp = temp;
-        client.gauge('mash_temperature', temp);
+    //Sample the temp every x seconds
+    every((10).seconds(), function(){
+      my.sampleTemp(my);
+
+
+      my.when(my.currentTemp > 75 && my.currentStep === "startup", function(){
+          my.robot.emit(my.currentStep);
+
       });
+
+      my.when(my.currentTemp >= my.recipe.mashTemp && my.currentStep === "heating-water",
+      function(){
+          my.robot.emit(my.currentStep);
+      })
+
+      client.gauge('mash_temperature', my.currentTemp);
+
+      console.log("Current step is " + my.currentStep);
+      console.log("Current temp is " + my.currentTemp);
 
     });
 
-    every((10).second(), function() {
+    my.robot.once("startup", function(){
+      my.sendMessage("Hey " + my.notify.name + ", Let's brew " + my.recipe.name + " today. " + my.recipe.url);
+      my.currentStep = "heating-water";
+    });
 
-      console.log(currentStep);
+    my.robot.once("heating-water", function(){
+      my.sendMessage("Water is up to strike temperature of " + my.recipe.mashTemp + "℉. " + my.notify.name);
+      my.currentStep = "mashing-start";
+      my.robot.emit(my.currentStep);
+    });
 
-      currentTime = new Date().getTime();
+    my.robot.once("mashing-start", function(){
+      my.sleep((180).seconds());
+      my.sendMessage("Starting mashing for " + my.recipe.mashTime
+      + "mins. " + my.notify.name);
 
-      if (currentStep === "starting") {
-        my.readTemp(prob, function (temp) {
-          my.sayTweet("Hey " + twitMention + ", Let's brew " + receipe.name + " today. " + receipe.url);
-        });
-        currentStep = "heating-water-start";
-      }
+      after((my.recipe.mashTime * 60).seconds(), function(){
+        my.sendMessage("Mashing is done, time to remove the grains and start the boil. " + my.notify.name);
+        my.currentStep = "mashing-done";
+        my.robot.emit(my.currentStep);
+      });
+    });
 
-      if (currentStep === "heating-water-start")  {
-        my.sayTweet("Bringing water to a temperature of " + receipe.mashTemp + "℉. " + twitMention);
-        currentStep = "heating-water-inprogress";
-      }
-
-      if (currentMashTemp >= receipe.mashTemp && currentStep === "heating-water-inprogress")  {
-        my.sayTweet("Water is up to strike temperature of " + receipe.mashTemp + "℉. " + twitMention);
-        currentStep = "heating-water-done";
-      }
-
-      if (currentStep === "heating-water-done")  {
-        my.sayTweet("Water is at strike temperature of " + currentMashTemp + "℉, it's time to add the grains. " + twitMention);
-        currentStep = "mashing-start";
-      }
-
-      if (currentStep === "mashing-start")  {
-        receipe.mashTimeEnd = new Date().getTime() + (receipe.mashTime * 60000)
-        my.sayTweet("Water is at strike temperature, it's time to add the grains. " + twitMention);
-        currentStep = "mashing-timer";
-      }
-
-      if (currentStep === "mashing-timer" && receipe.mashTimeEnd <= currentTime)  {
-        currentStep = "mashing-done";
-      }
-
-      if (currentStep === "mashing-done")  {
-        my.sayTweet("Mashing is done, time to remove the grains and start the boil. " + twitMention);
-        currentStep = "mashing-complete";
-      }
-
+    my.robot.once("mashing-done", function(){
+      console.log("Mashing process is done shutting down MashTron.")
+      Cylon.halt();
     });
   },
 
-  sayTweet: function(msg) {
-    console.log("Sending message to twitter.");
+  when: function(exp, callBack){
+    if (exp) {
+      callBack()
+    };
+  },
+
+  sampleTemp: function(my) {
+    var data = fs.readFileSync(my.probPath, 'utf8');
+
+    if (data.indexOf("NO") > -1) {
+        console.log("Unable to read sensor");
+    } else {
+      var tempCelsius = parseProbResults(data),
+      tempFahrenheit = celsiusToFahrenheit(tempCelsius);
+
+      my.currentTemp = tempFahrenheit;
+    }
+
+  },
+
+  sendMessage: function(msg) {
+    console.log("msg");
     twit.post('statuses/update', {status: msg},  function(error, params, response){
 
       if(error) {
@@ -103,24 +121,12 @@ Cylon.robot({
     });
   },
 
-  readTemp: function (probPath, probCallback) {
-    fs.readFile(probPath, 'utf8', function (err,data) {
-      if (err) {
-        return console.log(err);
-      }
-      if (data.indexOf("NO") > -1) {
-        console.log("Unable to read sensor");
-      } else {
-        var tempCelsius = parseProbResults(data),
-        tempFahrenheit = celsiusToFahrenheit(tempCelsius);
+  sleep: function sleep(ms) {
+    var start = Date.now(),
+        i;
 
-        probCallback(tempFahrenheit);
-
-      }
-
-    });
-
-  }
-
-
+    while(Date.now() < start + ms) {
+      i = 0;
+    }
+  },
 }).start();
